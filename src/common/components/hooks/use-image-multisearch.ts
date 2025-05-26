@@ -1,0 +1,216 @@
+import { useContext, useEffect, useState } from 'react';
+import type { ProductSearchResponse, ProductSearchResponseSuccess, ProductType } from 'visearch-javascript-sdk';
+import { WidgetDataContext } from '../../types/contexts';
+import { Actions, Category } from '../../types/tracking-constants';
+import type { SearchImageOrPid } from '../../types/image';
+import { isImageFile, isImageUrl, isPid } from '../../types/image';
+import type { BoxData, ProcessedProduct } from '../../types/product';
+import { getFlattenProducts, parseBox, parseToProductTypes } from '../../utils';
+
+const getMetadata = (
+  response: ProductSearchResponseSuccess,
+): Record<string, any> => {
+  return {
+    cat: Category.RESULT,
+    queryId: response.reqid,
+  };
+};
+
+const getSearchParams = (
+  img: SearchImageOrPid,
+  imageId: string,
+  searchSettings: Record<string, any>,
+  boxData: BoxData | undefined,
+  product: ProductType | undefined,
+): Record<string, any> => {
+  const params = { ...searchSettings };
+
+  if (isPid(img)) {
+    params['pid'] = img.pid;
+  } else if (isImageUrl(img)) {
+    params['im_url'] = img.imgUrl;
+  } else if (isImageFile(img)) {
+    params['image'] = img.files[0];
+  } else {
+    params['im_id'] = imageId;
+  }
+
+  if (boxData) {
+    params['box'] = parseBox(boxData.box);
+  }
+  if (product) {
+    params['detection'] = product.type;
+  }
+
+  return params;
+};
+
+const parseResults = (res: ProductSearchResponseSuccess, boxData?: BoxData): ProcessedProduct[] => {
+  if ('objects' in res) {
+    const index = boxData?.index ?? 0;
+    return getFlattenProducts(res.objects?.[index].result);
+  }
+
+  if ('result' in res) {
+    return getFlattenProducts(res.result);
+  }
+
+  return [];
+};
+
+interface ImageMultisearchProps {
+  image: SearchImageOrPid | undefined;
+  boxData: BoxData | undefined;
+}
+
+export interface ImageMultisearch {
+  imageId: string;
+  metadata: Record<string, any>;
+  productTypes: ProductType[];
+  error: string;
+  resetSearch: () => void;
+  multisearchWithParams: (params: Record<string, any>) => void;
+  productResults: ProcessedProduct[];
+  autocompleteWithQuery: (query: string) => void;
+  autocompleteResults: string[];
+}
+
+const useImageMultisearch = ({
+  image,
+  boxData,
+}: ImageMultisearchProps): ImageMultisearch => {
+  const { widgetConfig, widgetClient } = useContext(WidgetDataContext);
+  const { searchSettings } = widgetConfig;
+  const [response, setResponse] = useState<ProductSearchResponseSuccess | undefined>();
+  const [imageId, setImageId] = useState<string>('');
+  const [metadata, setMetadata] = useState<Record<string, any>>({});
+  const [productResults, setProductResults] = useState<ProcessedProduct[]>([]);
+  const [productTypes, setProductTypes] = useState<ProductType[]>([]);
+  const [error, setError] = useState<string>('');
+  const [autocompleteResults, setAutocompleteResults] = useState<string[]>([]);
+
+  const handleImageSuccess = (res: ProductSearchResponse): void => {
+    if (widgetConfig.callbacks?.preprocessResponse && typeof widgetConfig.callbacks.preprocessResponse === 'function') {
+      widgetConfig.callbacks.preprocessResponse(res);
+    }
+    if (res.status === 'fail') {
+      handleError(res.error.message);
+    } else {
+      setError('');
+      setResponse(res);
+    }
+  };
+
+  const handleAutocompleteSuccess = (res: ProductSearchResponse): void => {
+    if (widgetConfig.callbacks?.preprocessResponse && typeof widgetConfig.callbacks.preprocessResponse === 'function') {
+      widgetConfig.callbacks.preprocessResponse(res);
+    }
+    if (res.status === 'fail') {
+      handleError(res.error.message);
+    } else {
+      setError('');
+      const newAutocompleteResults = (res.result || []).map((r: any) => r.text);
+      setAutocompleteResults(newAutocompleteResults);
+    }
+  };
+
+  const handleError = (err: string): void => {
+    setError(err);
+  };
+
+  const resetSearch = (): void => {
+    setError('');
+    setImageId('');
+    setMetadata({});
+    setResponse(undefined);
+    setProductResults([]);
+    setProductTypes([]);
+  };
+
+  const getProductType = (boxData: BoxData | undefined): ProductType | undefined => {
+    if (boxData?.index) {
+      return productTypes[boxData.index];
+    }
+    return undefined;
+  };
+
+  const multisearch = (): void => {
+    if (image) {
+      const product = getProductType(boxData);
+      const params = getSearchParams(image, imageId, searchSettings, boxData, product);
+      widgetClient.multisearchByImage(params, handleImageSuccess, handleError);
+    } else {
+      resetSearch();
+    }
+  };
+
+  const multisearchWithParams = (params: Record<string, any>): void => {
+    params = {...params, ...searchSettings };
+    widgetClient.multisearchByImage(params, handleImageSuccess, handleError);
+  };
+
+  const autocompleteWithQuery = (q: string): void => {
+    let params = { q };
+
+    if (image) {
+      const product = getProductType(boxData);
+      params = { q, ...getSearchParams(image, imageId, searchSettings, boxData, product) };
+    } else if (!q) {
+      return;
+    }
+
+    widgetClient.multisearchAutocomplete(params, handleAutocompleteSuccess, handleError);
+  };
+
+  useEffect(() => {
+    if (response?.status === 'OK') {
+      const metadata = getMetadata(response);
+      const results = parseResults(response, boxData);
+      setProductResults(results);
+      setMetadata(metadata);
+      setImageId(response.im_id ?? '');
+
+      const productTypes = parseToProductTypes(response);
+      if (productTypes.length) {
+        setProductTypes(productTypes);
+      } else {
+        setProductTypes([]);
+      }
+
+      autocompleteWithQuery('');
+
+      if (results.length) {
+        widgetClient.sendEvent(Actions.RESULT_LOAD, metadata);
+        widgetClient.setLastTrackingMeta(metadata);
+      }
+    }
+  }, [response]);
+
+  useEffect(() => {
+    if (image) {
+      multisearch();
+    }
+  }, [boxData]);
+
+  useEffect(() => {
+    if (image) {
+      multisearch();
+    } else {
+      resetSearch();
+    }
+  }, [image]);
+
+  return {
+    imageId,
+    metadata,
+    productResults,
+    productTypes,
+    error,
+    autocompleteResults,
+    resetSearch,
+    autocompleteWithQuery,
+    multisearchWithParams,
+  };
+};
+
+export default useImageMultisearch;
